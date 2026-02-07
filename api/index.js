@@ -1,76 +1,107 @@
-// api/index.js
+const Busboy = require('busboy');
+const tf = require('@tensorflow/tfjs');
 const nsfw = require('nsfwjs');
-const tf = require('@tensorflow/tfjs-core');
-require('@tensorflow/tfjs-backend-cpu'); // استخدام المعالج بدلاً من كرت الشاشة
-const Jimp = require('jimp');
-const multiparty = require('multiparty');
+const jpeg = require('jpeg-js');
+const png = require('pngjs').PNG;
 
-// متغير لتخزين الموديل في الذاكرة لتسريع الطلبات المتكررة
+// نمنع Vercel من معالجة الجسم تلقائياً لنستطيع قراءة الصورة كـ Stream
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+// متغير لتخزين الموديل في الذاكرة (Caching) حتى لا نعيد تحميله مع كل طلب
 let _model;
 
 const loadModel = async () => {
   if (_model) {
     return _model;
   }
-  // تحميل الموديل من الروابط العامة الافتراضية لتقليل حجم الكود المرفوع
+  // تحميل الموديل بحجم صغير مناسب للسيرفرات
   _model = await nsfw.load();
   return _model;
 };
 
-const convertImage = async (imageBuffer) => {
-  const image = await Jimp.read(imageBuffer);
-  const width = image.bitmap.width;
-  const height = image.bitmap.height;
-  const pixelCount = width * height;
-  
-  const float32Data = new Float32Array(3 * pixelCount);
-  let i = 0;
-  
-  image.scan(0, 0, width, height, (x, y, idx) => {
-    float32Data[i++] = image.bitmap.data[idx + 0] / 255; // Red
-    float32Data[i++] = image.bitmap.data[idx + 1] / 255; // Green
-    float32Data[i++] = image.bitmap.data[idx + 2] / 255; // Blue
-  });
+// دالة لتحويل الصورة (Buffer) إلى Tensor
+const imageToTensor = (buffer, type) => {
+  let pixels;
+  let width, height;
 
-  const tensor = tf.tensor3d(float32Data, [height, width, 3]);
-  return tensor;
-};
-
-module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    return res.status(405).send('Only POST requests are allowed');
+  if (type === 'image/png') {
+    const pngImage = png.sync.read(buffer);
+    width = pngImage.width;
+    height = pngImage.height;
+    pixels = pngImage.data;
+  } else {
+    // نفترض أنها JPEG كخيار افتراضي
+    const jpegImage = jpeg.decode(buffer, { useTArray: true });
+    width = jpegImage.width;
+    height = jpegImage.height;
+    pixels = jpegImage.data;
   }
 
-  const form = new multiparty.Form();
+  // إنشاء Tensor من مصفوفة البيكسلات
+  // الرقم 3 يعني (RGB)، نحتاج لحذف قناة الشفافية (Alpha) إذا وجدت لأن الموديل يتدرب على 3 قنوات
+  const numChannels = 3;
+  const numPixels = width * height;
+  const values = new Int32Array(numPixels * numChannels);
 
-  form.parse(req, async (err, fields, files) => {
-    if (err) return res.status(500).json({ error: err.message });
-    
-    // تأكد من اسم الحقل الذي سترسل الصورة فيه، هنا افترضنا اسمه 'image'
-    const file = files.image && files.image[0];
-
-    if (!file) {
-      return res.status(400).json({ error: 'No image uploaded' });
+  for (let i = 0; i < numPixels; i++) {
+    for (let channel = 0; channel < numChannels; ++channel) {
+      values[i * numChannels + channel] = pixels[i * 4 + channel];
     }
+  }
 
-    try {
-      const model = await loadModel();
-      
-      // قراءة الصورة وتحويلها
-      const fs = require('fs');
-      const imageBuffer = fs.readFileSync(file.path);
-      const tensor = await convertImage(imageBuffer);
-
-      const predictions = await model.classify(tensor);
-      
-      // تنظيف الذاكرة
-      tensor.dispose();
-
-      res.status(200).json(predictions);
-      
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: 'Failed to classify image' });
-    }
-  });
+  return tf.tensor3d(values, [height, width, numChannels], 'int32');
 };
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+  }
+
+  const busboy = Busboy({ headers: req.headers });
+  let fileBuffer = null;
+  let mimeType = '';
+
+  return new Promise((resolve) => {
+    busboy.on('file', (fieldname, file, info) => {
+      const { mimeType: type } = info;
+      mimeType = type;
+      
+      const chunks = [];
+      file.on('data', (data) => chunks.push(data));
+      file.on('end', () => {
+        fileBuffer = Buffer.concat(chunks);
+      });
+    });
+
+    busboy.on('finish', async () => {
+      if (!fileBuffer) {
+        res.status(400).json({ error: 'No image file uploaded.' });
+        return resolve();
+      }
+
+      try {
+        const model = await loadModel();
+        
+        // تحويل الصورة وتحليلها
+        const tensor = imageToTensor(fileBuffer, mimeType);
+        const predictions = await model.classify(tensor);
+        
+        // تنظيف الذاكرة
+        tensor.dispose();
+
+        res.status(200).json(predictions);
+        resolve();
+      } catch (error) {
+        console.error('Error processing image:', error);
+        res.status(500).json({ error: 'Internal Server Error', details: error.message });
+        resolve();
+      }
+    });
+
+    req.pipe(busboy);
+  });
+}
