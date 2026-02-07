@@ -1,29 +1,31 @@
 const Busboy = require('busboy');
 const tf = require('@tensorflow/tfjs');
+require('@tensorflow/tfjs-backend-cpu'); // 👈 هذا هو السطر السحري للإصلاح
 const nsfw = require('nsfwjs');
 const jpeg = require('jpeg-js');
 const png = require('pngjs').PNG;
 
-// نمنع Vercel من معالجة الجسم تلقائياً لنستطيع قراءة الصورة كـ Stream
+// ضبط إعدادات Vercel
 export const config = {
   api: {
-    bodyParser: false,
+    bodyParser: false, // تعطيل الـ Body Parser لاستقبال الملفات
   },
 };
 
-// متغير لتخزين الموديل في الذاكرة (Caching) حتى لا نعيد تحميله مع كل طلب
+// متغير لتخزين الموديل
 let _model;
 
 const loadModel = async () => {
   if (_model) {
     return _model;
   }
-  // تحميل الموديل بحجم صغير مناسب للسيرفرات
-  _model = await nsfw.load();
+  // تعريف المعالج صراحةً لتجنب المشاكل
+  await tf.setBackend('cpu');
+  console.log('Loading model...');
+  _model = await nsfw.load(); 
   return _model;
 };
 
-// دالة لتحويل الصورة (Buffer) إلى Tensor
 const imageToTensor = (buffer, type) => {
   let pixels;
   let width, height;
@@ -34,15 +36,12 @@ const imageToTensor = (buffer, type) => {
     height = pngImage.height;
     pixels = pngImage.data;
   } else {
-    // نفترض أنها JPEG كخيار افتراضي
     const jpegImage = jpeg.decode(buffer, { useTArray: true });
     width = jpegImage.width;
     height = jpegImage.height;
     pixels = jpegImage.data;
   }
 
-  // إنشاء Tensor من مصفوفة البيكسلات
-  // الرقم 3 يعني (RGB)، نحتاج لحذف قناة الشفافية (Alpha) إذا وجدت لأن الموديل يتدرب على 3 قنوات
   const numChannels = 3;
   const numPixels = width * height;
   const values = new Int32Array(numPixels * numChannels);
@@ -57,8 +56,13 @@ const imageToTensor = (buffer, type) => {
 };
 
 export default async function handler(req, res) {
+  // 1. التعامل مع زيارة المتصفح العادية (GET)
+  if (req.method === 'GET') {
+    return res.status(200).send('<h1>Server is Running ✅</h1><p>Please send a POST request with an image to verify.</p>');
+  }
+
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   const busboy = Busboy({ headers: req.headers });
@@ -69,7 +73,6 @@ export default async function handler(req, res) {
     busboy.on('file', (fieldname, file, info) => {
       const { mimeType: type } = info;
       mimeType = type;
-      
       const chunks = [];
       file.on('data', (data) => chunks.push(data));
       file.on('end', () => {
@@ -79,25 +82,21 @@ export default async function handler(req, res) {
 
     busboy.on('finish', async () => {
       if (!fileBuffer) {
-        res.status(400).json({ error: 'No image file uploaded.' });
+        res.status(400).json({ error: 'No image uploaded' });
         return resolve();
       }
 
       try {
         const model = await loadModel();
-        
-        // تحويل الصورة وتحليلها
         const tensor = imageToTensor(fileBuffer, mimeType);
         const predictions = await model.classify(tensor);
-        
-        // تنظيف الذاكرة
         tensor.dispose();
 
         res.status(200).json(predictions);
         resolve();
       } catch (error) {
-        console.error('Error processing image:', error);
-        res.status(500).json({ error: 'Internal Server Error', details: error.message });
+        console.error('Error:', error);
+        res.status(500).json({ error: error.message });
         resolve();
       }
     });
