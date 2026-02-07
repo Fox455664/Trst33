@@ -1,0 +1,11 @@
+{
+  "name": "nsfw-api-vercel",
+  "version": "1.0.0",
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.10.0",
+    "busboy": "^1.6.0",
+    "jpeg-js": "^0.4.4",
+    "nsfwjs": "^2.4.2",
+    "pngjs": "^7.0.0"
+  }
+}
